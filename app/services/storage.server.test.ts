@@ -6,42 +6,48 @@
  * Copyright Oxide Computer Company
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { signUrl } from './storage.server'
+import { getExpiringUrl } from './storage.server'
 
-const expiration = 1665719939
-const keyName = 'key-name'
-const key = 'random-key-string'
+afterEach(() => {
+  vi.unstubAllEnvs()
+  vi.useRealTimers()
+})
 
 describe('Image url signing', () => {
-  it('Handles simple filenames', () => {
-    const url = 'https://oxide.computer/file.png'
+  it('generates a scoped S3 URL without exposing the secret access key', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-23T12:00:00Z'))
+    vi.stubEnv('STORAGE_URL', 'https://assets.example.com')
+    vi.stubEnv('STORAGE_REGION', 'us-east-1')
+    vi.stubEnv('STORAGE_BUCKET', 'rfd-assets')
+    vi.stubEnv('STORAGE_ACCESS_KEY_ID', 'rfd-site')
+    vi.stubEnv('STORAGE_SECRET_ACCESS_KEY', 'backend-only-secret')
 
-    const signedUrl = signUrl(url, expiration, key, keyName)
-
-    expect(signedUrl).toBe(
-      'https://oxide.computer/file.png?Expires=1665719939&KeyName=key-name&Signature=jAfxkbTs53ZhIWxq9G8qEXKyiRo',
+    const signedUrl = await getExpiringUrl('rfd/123/latest/file with spaces.png', 3600)
+    const encodedSourceUrl = await getExpiringUrl(
+      'rfd/123/latest/file%20with%20spaces.png',
+      3600,
     )
+    const url = new URL(signedUrl)
+
+    expect(encodedSourceUrl).toBe(signedUrl)
+    expect(url.origin + url.pathname).toBe(
+      'https://assets.example.com/rfd-assets/rfd/123/latest/file%20with%20spaces.png',
+    )
+    expect(url.searchParams.get('X-Amz-Algorithm')).toBe('AWS4-HMAC-SHA256')
+    expect(url.searchParams.get('X-Amz-Expires')).toBe('3600')
+    expect(url.searchParams.get('X-Amz-Credential')).toContain(
+      'rfd-site/20260823/us-east-1/s3/aws4_request',
+    )
+    expect(url.searchParams.get('X-Amz-Signature')).toMatch(/^[a-f0-9]{64}$/)
+    expect(signedUrl).not.toContain('backend-only-secret')
   })
 
-  it('Generates the same url independent of source url encoding', () => {
-    // Use both the non-encoded and the encoded form of this url to ensure that either one can be
-    // run through the signing step to generate the same valid url
-    const url = 'https://oxide.computer/file with spaces.png'
-
-    // This is the result of running `url` through `encodeURI`
-    const encodedUrl = 'https://oxide.computer/file%20with%20spaces.png'
-
-    const signedUrl = signUrl(url, expiration, key, keyName)
-    const signedEncodedUrl = signUrl(encodedUrl, expiration, key, keyName)
-
-    // Verify that the baseline url was signed correctly and encoded
-    expect(signedUrl).toBe(
-      'https://oxide.computer/file%20with%20spaces.png?Expires=1665719939&KeyName=key-name&Signature=kRxwhT3suBNu1giRQoVL_sabtVo',
-    )
-
-    // Verify that both the baseline url and the pre-encode url result in the same signed url
-    expect(signedUrl).toBe(signedEncodedUrl)
+  it('rejects paths that could escape the authorized RFD prefix', async () => {
+    await expect(
+      getExpiringUrl('rfd/123/latest/../../../rfd/999/secret.png', 3600),
+    ).rejects.toThrow('Invalid storage path')
   })
 })

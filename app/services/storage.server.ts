@@ -6,39 +6,35 @@
  * Copyright Oxide Computer Company
  */
 
-import { createHmac } from 'crypto'
+import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 
-export function getExpiringUrl(path: string, ttlInSeconds: number): string {
-  const expiration = Math.floor(Date.now() / 1000) + ttlInSeconds
-  const storageUrl = process.env.STORAGE_URL
-  const signingKey = process.env.STORAGE_KEY
-  const signingKeyName = process.env.STORAGE_KEY_NAME
-  const url = storageUrl + '/' + path
-
-  return signUrl(url, expiration, signingKey, signingKeyName)
+function requiredEnv(name: string): string {
+  const value = process.env[name]
+  if (!value) throw new Error(`Unable to generate image URLs without ${name} configured`)
+  return value
 }
 
-// The signing process is described by https://cloud.google.com/cdn/docs/using-signed-urls#programmatically_creating_signed_urls
-export function signUrl(
-  url: string,
-  expiration: number,
-  signingKey: string | undefined,
-  signingKeyName: string | undefined,
-): string {
-  if (!signingKey) {
-    throw new Error('Unable to generate image urls without a SIGNING_KEY configured')
-  }
+export async function getExpiringUrl(path: string, ttlInSeconds: number): Promise<string> {
+  const key = decodeURI(path)
+  if (key.split('/').includes('..')) throw new Error('Invalid storage path')
 
-  if (!signingKeyName) {
-    throw new Error('Unable to generate image urls without a SIGNING_KEY_NAME configured')
-  }
+  const client = new S3Client({
+    endpoint: requiredEnv('STORAGE_URL'),
+    region: requiredEnv('STORAGE_REGION'),
+    credentials: {
+      accessKeyId: requiredEnv('STORAGE_ACCESS_KEY_ID'),
+      secretAccessKey: requiredEnv('STORAGE_SECRET_ACCESS_KEY'),
+    },
+    forcePathStyle: true,
+  })
 
-  const key = Buffer.from(signingKey, 'base64')
-  const encodedUrl = encodeURI(decodeURI(url))
-
-  const urlToSign = `${encodedUrl}?Expires=${expiration}&KeyName=${signingKeyName}`
-  const sig = createHmac('sha1', key).update(urlToSign).digest('base64')
-  const cleanedSignature = sig.replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
-
-  return `${urlToSign}&Signature=${cleanedSignature}`
+  return await getSignedUrl(
+    client,
+    new GetObjectCommand({
+      Bucket: requiredEnv('STORAGE_BUCKET'),
+      Key: key,
+    }),
+    { expiresIn: ttlInSeconds },
+  )
 }
